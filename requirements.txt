@@ -1,0 +1,23 @@
+# Core Python dependencies
+python-dotenv>=1.0.1
+requests>=2.31.0
+pandas>=2.2.0
+
+# Dashboard (interfaz web)
+streamlit>=1.36.0
+
+# Opcional (manejo de datos y gráficos en dashboard)
+numpy>=1.26.0
+matplotlib>=3.9.0
+
+# Logging y utilidades
+rich>=13.7.0
+
+# Para evitar errores con websockets (futuras mejoras o SDK)
+websockets>=12.0
+
+# Si usas el SDK oficial (solo si planeas usarlo en lugar del REST)
+# binance-sdk-derivatives-trading-usds-futures>=1.0.0  # opcional
+
+# Desarrollo / compatibilidad
+typing-extensions>=4.10.0
