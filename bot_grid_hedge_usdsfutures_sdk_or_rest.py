@@ -1,73 +1,40 @@
-r"""
-Bot Grid + Hedge para USDS-M Futures (Binance) usando SDK si existe o REST oficial.
-
-Cambios clave:
-- Auto-TP basado en FILLS reales (/fapi/v1/userTrades), NO en entryPrice promedio.
-- Bootstrap de last_trade_id al iniciar para NO procesar trades históricos.
-- TP LIMIT maker (GTX) SIN reduceOnly (testnet suele rechazarlo); fallback a TAKE_PROFIT_MARKET por cantidad.
-- Hedge por defecto en modo REDUCE (cierra parte de la posición existente). OFFSET opcional.
-- Precio maker configurable con MAKER_EXTRA_TICKS (por defecto 2 ticks).
-- Re-grid por time-stop: **rearma solo las órdenes vencidas** al mismo precio con la cantidad restante.
-- Validación de MIN_NOTIONAL si existe.
-- Backoff exponencial en el loop ante errores persistentes.
-- Simulador opcional de fills en DRY_RUN (DRY_RUN_SIM=1) con de-duplicación de niveles.
-- Tracking de orderIds del GRID para filtrar fills; ignoramos hedges/TPs.
-- Kill-switch con doble cancelación defensiva de órdenes residuales.
-- **NUEVO**: _last_trade_id se actualiza SOLO tras procesar TPs (evita perder fills si cae el bot).
-- **NUEVO**: poda de _grid_order_ids contra openOrders (sin romper parciales).
-
-Cómo usar (Windows)
--------------------
-1) python -m venv .venv && .\.venv\Scripts\Activate.ps1
-2) python -m pip install -U python-dotenv requests
-3) Crear .env al lado del script:
-
-BINANCE_API_KEY=TU_KEY
-BINANCE_API_SECRET=TU_SECRET
-BINANCE_SYMBOL=BTCUSDT
-FAPI_BASE_URL=https://demo-fapi.binance.com
-GRID_LEVELS_PER_SIDE=5
-GRID_STEP_PCT=0.003
-ORDER_NOTIONAL_USD=500
-LEVERAGE=3
-MARGIN_MODE=ISOLATED
-HEDGE_ON_DRIFT_PCT=0.012
-HEDGE_ON_NET_FRACTION=0.30
-TIMESTOP_HOURS=3
-MAX_MARGIN_RATIO=0.35
-DRY_RUN=1
-HEDGE_MODE=REDUCE              # REDUCE (recomendado) u OFFSET
-MAKER_EXTRA_TICKS=2            # ticks extra para asegurar maker
-DRY_RUN_SIM=0                  # 1 para simular fills en dry-run
-
-Seguridad:
-- Si DRY_RUN=0, exige que FAPI_BASE_URL contenga 'demo-fapi' para evitar enviar a real por error.
-"""
 from __future__ import annotations
-
 import os
 import time
+import math
 import hmac
+import json
 import hashlib
 import logging
-import math
+import random
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple
-from pathlib import Path
 from urllib.parse import urlencode
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
+from logging.handlers import TimedRotatingFileHandler
 
-# ============================== Carga de entorno ===============================
+# =========================
+#  CARGA .env
+# =========================
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
-BASE = os.getenv("FAPI_BASE_URL", "")
-if os.getenv("DRY_RUN", "1") == "0":
-    assert "demo-fapi" in BASE, "Bloqueado: DRY_RUN=0 pero no estás en demo-fapi (testnet)."
+BASE = os.getenv("FAPI_BASE_URL", "https://demo-fapi.binance.com").rstrip("/")
+DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
+AIRBAG_REQUIRE_DEMO = os.getenv("AIRBAG_REQUIRE_DEMO", "0") == "1"
 
-# ============================= Utilidades numéricas ============================
+if not DRY_RUN and AIRBAG_REQUIRE_DEMO:
+    assert "demo-fapi" in BASE, "Bloqueado: DRY_RUN=0 pero AIRBAG exige demo-fapi."
+
+# =========================
+#  HELPERS NUMÉRICOS
+# =========================
 
 def round_step(value: float, step: float) -> float:
     if step <= 0:
@@ -80,52 +47,136 @@ def round_to_precision(value: float, precision: int) -> float:
     q = Decimal(10) ** -precision
     return float((Decimal(str(value))).quantize(q, rounding=ROUND_DOWN))
 
-# ================================== Config ====================================
+def decimals_from_step(step: float) -> int:
+    d = Decimal(str(step)).normalize()
+    return -d.as_tuple().exponent if d.as_tuple().exponent < 0 else 0
+
+# =========================
+#  CONFIG
+# =========================
 
 @dataclass
 class Config:
     api_key: str
     api_secret: str
     base_url: str
-    symbol: str = "BTCUSDT"
-    levels_per_side: int = 5
-    step_pct: float = 0.003
-    order_notional: float = 500.0
-    leverage: int = 3
+    symbol: str = "BTCUSDC"
+    levels_per_side: int = 10
+    step_pct: float = 0.0020
+    order_notional: float = 300.0
+    leverage: int = 5
     margin_mode: str = "ISOLATED"
+    min_available_balance_usd: float = 500.0
+
     hedge_on_drift_pct: float = 0.012
-    hedge_on_net_fraction: float = 0.30
-    time_stop_hours: float = 3.0
+    hedge_on_net_fraction: float = 0.25
+    hedge_fraction_min: float = 0.50
+    hedge_fraction_max: float = 0.70
+
+    recenter_drift_partial: float = 0.012
+    recenter_drift_full: float = 0.025
+
+    timestop_hours_base: float = 6.0
+    timestop_hours_fast: float = 2.0
+    drift_fast_pct: float = 0.008
+
+    funding_rate_warn_8h: float = 0.0004
+    funding_fee_warn_usd: float = 15.0
+
+    panic_range_5m_pct: float = 0.032
+    unpause_range_5m_pct: float = 0.008
+    unpause_stable_blocks: int = 4
+
     max_margin_ratio: float = 0.35
+    max_same_side_levels: int = 10
+    daily_stop_loss_usd: float = 260.0
+    circuit_breaker_loss_l1: float = 150.0
+    circuit_breaker_loss_l2: float = 250.0
+    max_hedges_per_4h: int = 3
+
     dry_run: bool = True
-    # Nuevos
-    hedge_mode: str = "REDUCE"          # REDUCE (cierra parte) u OFFSET (abre opuesta)
-    maker_extra_ticks: int = 2           # ticks extra para asegurar maker
-    dry_run_sim: bool = False            # simulador de fills en dry-run
+    maker_ticks_away: int = 2
+    time_stop_cancel_only: bool = False
+
+    recv_window_ms: int = 10000
+    http_connect_timeout: float = 5.0
+    http_read_timeout: float = 25.0
+    http_retry_total: int = 5
+    http_retry_connect: int = 3
+    http_retry_read: int = 3
+    http_backoff_factor: float = 0.5
+    http_status_forcelist: tuple = (429, 500, 502, 503, 504)
+
+    # === Logging / Events flags ===
+    event_include_pnl: bool = False
+    event_include_oid: bool = True
+    snapshot_freq_min: int = 60
 
     @staticmethod
     def from_env() -> "Config":
+        # Clamp de la frecuencia de snapshots a [1, +∞)
+        snapshot_freq_min = int(os.getenv("SNAPSHOT_FREQ_MIN", "60"))
+        snapshot_freq_min = max(1, snapshot_freq_min)
+
         return Config(
+            event_include_pnl=os.getenv("EVENT_INCLUDE_PNL", "0") == "1",
+            event_include_oid=os.getenv("EVENT_INCLUDE_OID", "1") == "1",
+            snapshot_freq_min=snapshot_freq_min,
+
             api_key=os.getenv("BINANCE_API_KEY", ""),
             api_secret=os.getenv("BINANCE_API_SECRET", ""),
-            base_url=os.getenv("FAPI_BASE_URL", "https://demo-fapi.binance.com").rstrip("/"),
-            symbol=os.getenv("BINANCE_SYMBOL", "BTCUSDT").upper(),
-            levels_per_side=int(os.getenv("GRID_LEVELS_PER_SIDE", "5")),
-            step_pct=float(os.getenv("GRID_STEP_PCT", "0.003")),
-            order_notional=float(os.getenv("ORDER_NOTIONAL_USD", "500")),
-            leverage=int(os.getenv("LEVERAGE", "3")),
+            base_url=os.getenv("FAPI_BASE_URL", BASE),
+            symbol=os.getenv("BINANCE_SYMBOL", "BTCUSDC").upper(),
+            levels_per_side=int(os.getenv("GRID_LEVELS_PER_SIDE", "10")),
+            step_pct=float(os.getenv("GRID_STEP_PCT", "0.0020")),
+            order_notional=float(os.getenv("ORDER_NOTIONAL_USD", "300")),
+            leverage=int(os.getenv("LEVERAGE", "5")),
             margin_mode=os.getenv("MARGIN_MODE", "ISOLATED").upper(),
+            min_available_balance_usd=float(os.getenv("MIN_AVAILABLE_BALANCE_USD","500")),
+
             hedge_on_drift_pct=float(os.getenv("HEDGE_ON_DRIFT_PCT", "0.012")),
-            hedge_on_net_fraction=float(os.getenv("HEDGE_ON_NET_FRACTION", "0.30")),
-            time_stop_hours=float(os.getenv("TIMESTOP_HOURS", "3")),
+            hedge_on_net_fraction=float(os.getenv("HEDGE_ON_NET_FRACTION", "0.25")),
+            hedge_fraction_min=float(os.getenv("HEDGE_FRACTION_MIN", "0.50")),
+            hedge_fraction_max=float(os.getenv("HEDGE_FRACTION_MAX", "0.70")),
+
+            recenter_drift_partial=float(os.getenv("RECENTER_DRIFT_PARTIAL", "0.012")),
+            recenter_drift_full=float(os.getenv("RECENTER_DRIFT_FULL", "0.025")),
+
+            timestop_hours_base=float(os.getenv("TIMESTOP_HOURS_BASE", "6")),
+            timestop_hours_fast=float(os.getenv("TIMESTOP_HOURS_FAST", "2")),
+            drift_fast_pct=float(os.getenv("DRIFT_FAST_PCT", "0.008")),
+
+            funding_rate_warn_8h=float(os.getenv("FUNDING_RATE_WARN_8H", "0.0004")),
+            funding_fee_warn_usd=float(os.getenv("FUNDING_FEE_WARN_USD", "15")),
+
+            panic_range_5m_pct=float(os.getenv("PANIC_RANGE_5M_PCT", "0.032")),
+            unpause_range_5m_pct=float(os.getenv("UNPAUSE_RANGE_5M_PCT", "0.008")),
+            unpause_stable_blocks=int(os.getenv("UNPAUSE_STABLE_BLOCKS", "4")),
+
             max_margin_ratio=float(os.getenv("MAX_MARGIN_RATIO", "0.35")),
+            max_same_side_levels=int(os.getenv("MAX_SAME_SIDE_LEVELS", "10")),
+            daily_stop_loss_usd=float(os.getenv("DAILY_STOP_LOSS_USD", "260")),
+            circuit_breaker_loss_l1=float(os.getenv("CIRCUIT_BREAKER_L1", "150")),
+            circuit_breaker_loss_l2=float(os.getenv("CIRCUIT_BREAKER_L2", "250")),
+            max_hedges_per_4h=int(os.getenv("MAX_HEDGES_PER_4H", "3")),
+
             dry_run=os.getenv("DRY_RUN", "1") == "1",
-            hedge_mode=os.getenv("HEDGE_MODE", "REDUCE").upper(),
-            maker_extra_ticks=int(os.getenv("MAKER_EXTRA_TICKS", "2")),
-            dry_run_sim=os.getenv("DRY_RUN_SIM", "0") == "1",
+            maker_ticks_away=int(os.getenv("MAKER_TICKS_AWAY", "2")),
+            time_stop_cancel_only=os.getenv("TIME_STOP_CANCEL_ONLY", "0") == "1",
+
+            recv_window_ms=int(os.getenv("RECV_WINDOW_MS", "10000")),
+            http_connect_timeout=float(os.getenv("HTTP_CONNECT_TIMEOUT", "5")),
+            http_read_timeout=float(os.getenv("HTTP_READ_TIMEOUT", "25")),
+            http_retry_total=int(os.getenv("HTTP_RETRY_TOTAL", "5")),
+            http_retry_connect=int(os.getenv("HTTP_RETRY_CONNECT", "3")),
+            http_retry_read=int(os.getenv("HTTP_RETRY_READ", "3")),
+            http_backoff_factor=float(os.getenv("HTTP_BACKOFF_FACTOR", "0.5")),
         )
 
-# =========================== Cliente (SDK/REST) ================================
+
+# =========================
+#  CLIENTE REST
+# =========================
 
 class FuturesClient:
     def mark_price(self, symbol: str) -> float: ...
@@ -137,20 +188,51 @@ class FuturesClient:
     def change_margin_type(self, symbol: str, margin_type: str) -> Dict: ...
     def new_order(self, **params) -> Optional[Dict]: ...
     def cancel_all_open_orders(self, symbol: str) -> Dict: ...
-    def cancel_order(self, symbol: str, order_id: int) -> Dict: ...
     def get_open_orders(self, symbol: str) -> List[Dict]: ...
-    def user_trades(self, symbol: str, limit: int = 50, from_id: Optional[int] = None) -> List[Dict]: ...
+    def get_order(self, symbol: str, origClientOrderId: str | None = None, orderId: int | None = None) -> Dict: ...
+    def cancel_order(self, symbol: str, order_id: int) -> Dict: ...
+    def user_trades(self, symbol: str, from_id: int | None = None, limit: int = 1000,
+                    start_time: int | None = None, end_time: int | None = None) -> List[Dict]: ...
+    def premium_index(self, symbol: str) -> Dict: ...
+    def income_history(self, symbol: str, start_time: int | None = None,
+                      end_time: int | None = None, limit: int = 1000) -> List[Dict]: ...
+    def recreate_session(self): ...
 
 class RestClient(FuturesClient):
     def __init__(self, cfg: Config):
+        self.cfg = cfg
         self.key = cfg.api_key
         self.secret = cfg.api_secret.encode()
-        self.base = cfg.base_url
+        self.base = cfg.base_url.rstrip("/")
+        self._build_session()
+
+    def _build_session(self):
         self.session = requests.Session()
         self.session.headers.update({
             "X-MBX-APIKEY": self.key,
             "Content-Type": "application/x-www-form-urlencoded",
         })
+        retry = Retry(
+            total=self.cfg.http_retry_total,
+            connect=self.cfg.http_retry_connect,
+            read=self.cfg.http_retry_read,
+            backoff_factor=self.cfg.http_backoff_factor,
+            status_forcelist=self.cfg.http_status_forcelist,
+            allowed_methods={"GET", "POST", "DELETE"},
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.timeout = (self.cfg.http_connect_timeout, self.cfg.http_read_timeout)
+
+    def recreate_session(self):
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self._build_session()
 
     def _ts(self) -> int:
         return int(time.time() * 1000)
@@ -163,45 +245,62 @@ class RestClient(FuturesClient):
     def _get(self, path: str, params: Dict | None = None, signed: bool = False):
         url = f"{self.base}{path}"
         if signed:
-            qs = self._qs_signed({"timestamp": self._ts(), "recvWindow": 5000, **(params or {})})
+            qs = self._qs_signed({"timestamp": self._ts(), "recvWindow": self.cfg.recv_window_ms, **(params or {})})
             full = url + "?" + qs
-            r = self.session.get(full, timeout=10)
+            r = self.session.get(full, timeout=self.timeout)
         else:
-            r = self.session.get(url, params=params or {}, timeout=10)
+            r = self.session.get(url, params=params or {}, timeout=self.timeout)
+        # Logging de errores GET
         if r.status_code >= 400:
-            logging.error("GET %s %s", path, r.text)
+            try:
+                j = r.json() if r.text else {}
+            except Exception:
+                j = {}
+            logging.error("GET %s %s", path, j.get("msg", r.text))
         r.raise_for_status()
         return r.json()
 
     def _post(self, path: str, data: Dict | None = None, signed: bool = True):
         url = f"{self.base}{path}"
         if signed:
-            qs = self._qs_signed({"timestamp": self._ts(), "recvWindow": 5000, **(data or {})})
-            r = self.session.post(url, data=qs, timeout=10)  # body form-urlencoded exacto
+            qs = self._qs_signed({"timestamp": self._ts(), "recvWindow": self.cfg.recv_window_ms, **(data or {})})
+            r = self.session.post(url, data=qs, timeout=self.timeout)
         else:
-            r = self.session.post(url, data=(data or {}), timeout=10)
+            r = self.session.post(url, data=(data or {}), timeout=self.timeout)
+        # Manejo de no-ops 4059/4046
+        try:
+            j = r.json() if r.text else {}
+        except Exception:
+            j = {}
         if r.status_code >= 400:
+            code = j.get("code")
+            if code in (-4059, -4046):
+                logging.info("No-op POST %s: %s (code %s)", path, j.get("msg", ""), code)
+                return {"ok": True, "_noop": True, "code": code, "msg": j.get("msg", "")}
             logging.error("POST %s %s", path, r.text)
-        r.raise_for_status()
-        return r.json() if r.text else {}
+            r.raise_for_status()
+            return j
+        return j if j is not None else {}
 
     def _delete(self, path: str, params: Dict | None = None, signed: bool = True):
         url = f"{self.base}{path}"
         if signed:
-            qs = self._qs_signed({"timestamp": self._ts(), "recvWindow": 5000, **(params or {})})
+            qs = self._qs_signed({"timestamp": self._ts(), "recvWindow": self.cfg.recv_window_ms, **(params or {})})
             full = url + "?" + qs
-            r = self.session.delete(full, timeout=10)
+            r = self.session.delete(full, timeout=self.timeout)
         else:
-            r = self.session.delete(url, params=params or {}, timeout=10)
+            r = self.session.delete(url, params=params or {}, timeout=self.timeout)
         if r.status_code >= 400:
             logging.error("DELETE %s %s", path, r.text)
         r.raise_for_status()
         return r.json() if r.text else {}
 
-    # ----- Métodos públicos -----
     def mark_price(self, symbol: str) -> float:
         j = self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
         return float(j["markPrice"])
+
+    def premium_index(self, symbol: str) -> Dict:
+        return self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
 
     def exchange_info(self) -> Dict:
         return self._get("/fapi/v1/exchangeInfo")
@@ -222,7 +321,7 @@ class RestClient(FuturesClient):
         try:
             return self._post("/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type})
         except requests.HTTPError as e:
-            logging.warning("change_margin_type warning: %s", e)
+            logging.warning("change_margin_type: %s", e)
             return {}
 
     def new_order(self, **params) -> Optional[Dict]:
@@ -232,519 +331,1244 @@ class RestClient(FuturesClient):
             logging.error("new_order error: %s", e)
             return None
 
+    def get_open_orders(self, symbol: str) -> List[Dict]:
+        return self._get("/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+
     def cancel_all_open_orders(self, symbol: str) -> Dict:
         return self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
 
     def cancel_order(self, symbol: str, order_id: int) -> Dict:
         return self._delete("/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
 
-    def get_open_orders(self, symbol: str) -> List[Dict]:
-        return self._get("/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+    def get_order(self, symbol: str, origClientOrderId: str | None = None, orderId: int | None = None) -> Dict:
+        p = {"symbol": symbol}
+        if origClientOrderId:
+            p["origClientOrderId"] = origClientOrderId
+        if orderId:
+            p["orderId"] = orderId
+        return self._get("/fapi/v1/order", p, signed=True)
 
-    def user_trades(self, symbol: str, limit: int = 50, from_id: Optional[int] = None) -> List[Dict]:
-        params = {"symbol": symbol, "limit": limit}
+    def user_trades(self, symbol: str, from_id: int | None = None, limit: int = 1000,
+                    start_time: int | None = None, end_time: int | None = None) -> List[Dict]:
+        p = {"symbol": symbol, "limit": limit}
         if from_id is not None:
-            params["fromId"] = from_id
-        return self._get("/fapi/v1/userTrades", params, signed=True)
+            p["fromId"] = from_id
+        if start_time:
+            p["startTime"] = start_time
+        if end_time:
+            p["endTime"] = end_time
+        return self._get("/fapi/v1/userTrades", p, signed=True)
 
-class SdkClient(RestClient):
-    """Intenta usar el SDK; si no está, hereda REST."""
-    def __init__(self, cfg: Config):
-        super().__init__(cfg)
-        self._sdk = None
-        try:
-            import binance_sdk_derivatives_trading_usds_futures as usds
-            if hasattr(usds, "Client"):
-                self._sdk = usds.Client(api_key=cfg.api_key, api_secret=cfg.api_secret, base_url=cfg.base_url)
-            elif hasattr(usds, "Api"):
-                self._sdk = usds.Api(api_key=cfg.api_key, api_secret=cfg.api_secret, base_url=cfg.base_url)
-            else:
-                logging.warning("SDK USDS-M instalado pero sin clase conocida; usando REST")
-        except Exception as e:
-            logging.info("SDK USDS-M no disponible (%s); usando REST", e)
+    def income_history(self, symbol: str, start_time: int | None = None,
+                      end_time: int | None = None, limit: int = 1000) -> List[Dict]:
+        p = {"symbol": symbol, "limit": limit}
+        if start_time:
+            p["startTime"] = start_time
+        if end_time:
+            p["endTime"] = end_time
+        return self._get("/fapi/v1/income", p, signed=True)
 
-# ============================== Estrategia Grid + Hedge =========================
+# =========================
+#  ESTADO
+# =========================
 
 @dataclass
 class GridState:
     center: float
     last_recenter_ts: float
 
+@dataclass
+class HedgePosition:
+    side: str  # "LONG" o "SHORT" (posición hedge)
+    qty: float
+    entry_price: float
+    entry_time: float
+    notional: float
+
+# =========================
+#  BOT
+# =========================
+LOCAL_TZ = timezone(timedelta(hours=-4))  # República Dominicana (UTC-4)
+
+RUN_ID = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+
+def utcnow():
+    return datetime.now(LOCAL_TZ).isoformat(timespec="seconds")
+
 class GridHedgeBot:
     def __init__(self, client: FuturesClient, cfg: Config):
         self.c = client
         self.cfg = cfg
         self.state = GridState(center=self.c.mark_price(cfg.symbol), last_recenter_ts=time.time())
-        # Defaults seguros; se sobreescriben con exchangeInfo()
+        self._last_drift_log_ts = 0.0
         self.price_precision = 2
         self.qty_precision = 6
         self.tick_size = 0.1
-        self.step_size = 0.000001
-        self.min_notional = None
-        # Track de fills y grid
-        self._last_trade_id: Optional[int] = None
-        self._grid_order_ids: set[int] = set()   # ids de órdenes del grid activas
-        self._simulated_fills = set()            # de-duplicación del simulador
-        # Caches (si en algún momento miras deltas por posición)
-        self._prev_long_qty = 0.0
-        self._prev_short_qty = 0.0
+        self.step_size = 0.001
+        self.min_notional = 5.0
+        self.min_qty = 0.0
         self._load_filters()
 
+        self._grid_order_ids: set[int] = set()
+        self._grid_order_meta: dict[int, Tuple[str,str,float,float]] = {}
+        self._last_trade_id: Optional[int] = None
+
+        self._price_history_5m: List[Tuple[float, float]] = []  # para pánico
+        self._price_hist_long: List[Tuple[float, float]] = []   # para trending 4h
+        self._paused = False
+        self._stable_blocks = 0
+
+        self._active_hedges: List[HedgePosition] = []
+        # Historial: (timestamp, "open"/"close", side[LONG/SHORT])
+        self._hedge_history: List[Tuple[float, str, str]] = []
+
+        self._pnl_cache: Optional[float] = None
+        self._pnl_cache_time: float = 0
+        self._pnl_cache_ttl: float = 60.0
+
+        self._daily_start_balance: Optional[float] = None
+        self._daily_start_time: float = time.time()
+        self._daily_realized_pnl: float = 0.0
+        self._daily_funding_paid: float = 0.0
+
+        self._circuit_level: int = 0
+        self._last_trending_log_ts: float = 0.0
+
+    # === Logger de eventos estructurados (JSONL) ===
+
+    def _event(self, name: str, **data):
+        # Obtener mark price con tolerancia
+        try:
+            mp = self.c.mark_price(self.cfg.symbol)
+        except Exception:
+            mp = None
+
+        # No mutar 'data' original
+        ev = dict(data or {})
+
+        # Filtros por flags
+        if not self.cfg.event_include_oid:
+            ev.pop("oid", None)
+        if not self.cfg.event_include_pnl:
+            ev.pop("pnl", None)
+
+        payload = {
+            "ts": utcnow(),
+            "run_id": RUN_ID,
+            "symbol": getattr(self.cfg, "symbol", None),
+            "event": name,
+            "mp": round(mp, 2) if isinstance(mp, (int, float)) else mp,
+            "center": (
+                round(getattr(getattr(self, "state", None), "center", None) or 0, 2)
+                if hasattr(self, "state") else None
+            ),
+            "circuit": getattr(self, "_circuit_level", None),
+            "paused": getattr(self, "_paused", None),
+        }
+        payload.update(ev)
+        logging.getLogger("events").info(json.dumps(payload, separators=(",", ":")))
+
+
+    # === Filtros del exchange ===
     def _load_filters(self):
         info = self.c.exchange_info()
-        sym = None
-        for s in info.get("symbols", []):
-            if s.get("symbol") == self.cfg.symbol:
-                sym = s
-                break
-        if not sym:
-            raise RuntimeError(f"Símbolo no disponible: {self.cfg.symbol}")
+        syms = {s["symbol"]: s for s in info.get("symbols", [])}
+        sym = syms.get(self.cfg.symbol, {})
         fs = {f["filterType"]: f for f in sym.get("filters", [])}
+
         self.price_precision = sym.get("pricePrecision", 2)
         self.qty_precision = sym.get("quantityPrecision", 6)
         self.tick_size = float(fs["PRICE_FILTER"]["tickSize"]) if "PRICE_FILTER" in fs else 0.1
-        self.step_size = float(fs["LOT_SIZE"]["stepSize"]) if "LOT_SIZE" in fs else 0.000001
-        if "MIN_NOTIONAL" in fs:
-            try:
-                self.min_notional = float(fs["MIN_NOTIONAL"]["notional"])
-            except Exception:
-                self.min_notional = None
-        logging.info(
-            "Symbol filters: tick_size=%s step_size=%s price_precision=%s qty_precision=%s min_notional=%s",
-            self.tick_size, self.step_size, self.price_precision, self.qty_precision, self.min_notional
-        )
+        self.step_size = float(fs["LOT_SIZE"]["stepSize"]) if "LOT_SIZE" in fs else 0.001
+        self.min_notional = float(fs.get("MIN_NOTIONAL", {}).get("notional", 5.0))
 
-    # -------------------- Helpers de cantidad / precio ------------------
+        if "LOT_SIZE" in fs:
+            self.min_qty = float(fs["LOT_SIZE"].get("minQty", 0.0))
 
-    @staticmethod
-    def _decimals_from_step(step: float) -> int:
-        d = Decimal(str(step)).normalize()
-        return -d.as_tuple().exponent if d.as_tuple().exponent < 0 else 0
+        logging.info("Filtros: tick=%.4f step=%.6f minQty=%.6f min_not=%.2f",
+                     self.tick_size, self.step_size, self.min_qty, self.min_notional)
+
+    # === Utilidades ===
+    def _qty_from_notional(self, notional_usd: float, price: float) -> float:
+        if price <= 0:
+            return 0.0
+        if notional_usd < self.min_notional:
+            raise ValueError(f"ORDER_NOTIONAL_USD menor a minNotional ({self.min_notional}).")
+        qty = notional_usd / price
+        qty = max(self.step_size, round_step(qty, self.step_size))
+
+        if self.min_qty > 0 and qty < self.min_qty:
+            qty = self.min_qty
+
+        return round_to_precision(qty, self.qty_precision)
 
     def _snap_to_tick(self, price: float) -> float:
         ts = self.tick_size
-        ticks = math.floor(price / ts + 1e-12)  # evita glitches de float
+        ticks = math.floor(price / ts + 1e-12)
         p = ticks * ts
-        decs = self._decimals_from_step(ts)
+        decs = decimals_from_step(ts)
         return float(Decimal(str(p)).quantize(Decimal('1.' + '0'*decs)) if decs > 0 else Decimal(int(p)))
 
     def _maker_price(self, is_buy: bool, raw_price: float) -> float:
-        """
-        Devuelve un precio válido maker:
-        - múltiplo exacto de tickSize
-        - post-only (GTX) alejándolo K ticks del cruce (K = maker_extra_ticks)
-        """
         ts = self.tick_size
-        k = max(1, int(self.cfg.maker_extra_ticks))
+        n = max(1, int(self.cfg.maker_ticks_away))
         if is_buy:
-            p = math.floor(raw_price / ts) * ts - k * ts
+            p = math.floor(raw_price / ts) * ts - n * ts
         else:
-            p = math.ceil(raw_price / ts) * ts + k * ts
+            p = math.ceil(raw_price / ts) * ts + n * ts
         p = max(ts, p)
         return self._snap_to_tick(p)
 
-    def _qty_from_notional(self, notional_usd: float, price: float) -> float:
-        # Ajuste a MIN_NOTIONAL si existe
-        if self.min_notional is not None and notional_usd < self.min_notional:
-            notional_usd = self.min_notional
-        qty = notional_usd / price
-        qty = max(self.step_size, round_step(qty, self.step_size))
-        return round_to_precision(qty, self.qty_precision)
+    def _cid(self, tag: str, side: str, pos_side: str, price: float, qty: float) -> str:
+        raw = f"{tag}|{self.cfg.symbol}|{side}|{pos_side}|{price:.2f}|{qty:.6f}|{time.time()}"
+        return "CID_" + hashlib.sha1(raw.encode()).hexdigest()[:20]
 
-    # ------------------------- Colocación de grid -----------------------
-
-    def _place_limit(self, side: str, pos_side: str, price: float, qty: float,
-                     reduce_only: bool = False, tag: str = ""):
-        price = self._maker_price(side.upper() == "BUY", price)
-        # Validación de min_notional
-        if self.min_notional is not None and price * qty < self.min_notional - 1e-8:
-            logging.warning("skip order: notional %.2f < MIN_NOTIONAL %.2f", price * qty, self.min_notional)
-            return None
-
-        logging.info("ORDER %s %s qty=%.8f @ %.2f reduceOnly=%s %s",
-                     side, pos_side, qty, price, reduce_only, tag)
-        if self.cfg.dry_run:
-            return None
-
-        params = {
-            "symbol": self.cfg.symbol,
-            "side": side.upper(),          # BUY / SELL
-            "type": "LIMIT",
-            "timeInForce": "GTX",          # Post-Only (maker)
-            "quantity": str(qty),
-            "price": str(price),
-            "positionSide": pos_side.upper()
-        }
-        # LIMIT soporta reduceOnly; para TPs evitamos reduceOnly por errores de testnet
-        if reduce_only:
-            params["reduceOnly"] = "true"
-
-        return self.c.new_order(**params)
-
-    def _reset_grid_tracking(self):
-        self._grid_order_ids.clear()
-
-    def place_take_profit_for_fill(self, side: str, pos_side: str, fill_price: float, qty: float):
-        """
-        1) TP LIMIT maker (GTX) usando positionSide correcto y SIN reduceOnly (testnet a veces rechaza reduceOnly).
-        2) Si falla, fallback a TAKE_PROFIT_MARKET con 'quantity' (sin reduceOnly/closePosition).
-           En dual-hedge + positionSide, eso reduce la posición de ese lado.
-        """
-        if side.upper() == "BUY":
-            tp = fill_price * (1 + self.cfg.step_pct)
-            close_side = "SELL"   # cerrar LONG
+    # === Órdenes ===
+    def _place_limit(self, side: str, pos_side: str, price: float, qty: float, tag: str = "") -> Optional[Dict]:
+        # Para TP usamos el precio tal cual (solo ajuste al tick),
+        # para el resto seguimos usando _maker_price (post-only n ticks).
+        if tag.upper() == "TP":
+            price_used = self._snap_to_tick(price)
         else:
-            tp = fill_price * (1 - self.cfg.step_pct)
-            close_side = "BUY"    # cerrar SHORT
+            price_used = self._maker_price(side.upper() == "BUY", price)
 
-        logging.info("TP PLAN: close_side=%s pos_side=%s fill_px=%.2f qty=%.6f", close_side, pos_side, fill_price, qty)
+        cid = self._cid(tag or "GRID", side, pos_side, price_used, qty)
 
-        # intento 1: LIMIT maker (GTX) sin reduceOnly (positionSide garantiza reducción)
-        r = self._place_limit(close_side, pos_side, tp, qty, reduce_only=False, tag="TP")
-        if r is not None:
-            return r
+        logging.info("LIMIT %s %s qty=%.6f @ %.2f %s", side, pos_side, qty, price_used, tag or "")
 
-        # fallback: TAKE_PROFIT_MARKET por cantidad (sin reduceOnly/closePosition)
-        stop = self._snap_to_tick(tp)
-        params = {
-            "symbol": self.cfg.symbol,
-            "side": close_side,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": str(stop),
-            "positionSide": pos_side.upper(),
-            "workingType": "MARK_PRICE",
-            "quantity": str(round_step(qty, self.step_size))
-        }
-        logging.warning("TP LIMIT rechazado; usando TAKE_PROFIT_MARKET qty=%s stop=%s", params["quantity"], stop)
         if self.cfg.dry_run:
             return None
+
+        params = {
+            "symbol": self.cfg.symbol,
+            "side": side.upper(),
+            "type": "LIMIT",
+            "timeInForce": "GTX",  # seguimos siendo post-only
+            "quantity": str(qty),
+            "price": str(price_used),
+            "positionSide": pos_side.upper(),
+            "newClientOrderId": cid,
+        }
+
         try:
             return self.c.new_order(**params)
+        except (requests.ReadTimeout, requests.ConnectionError):
+            try:
+                ex = self.c.get_order(self.cfg.symbol, origClientOrderId=cid)
+                st = (ex or {}).get("status", "")
+                if st in ("NEW", "PARTIALLY_FILLED", "FILLED"):
+                    logging.warning("Orden existe: %s", cid)
+                    return ex
+            except Exception:
+                pass
+            raise
         except Exception as e:
-            logging.error("fallback TP error: %s", e)
+            logging.error("place_limit: %s", e)
+            return None
+            
+
+    def _place_market_hedge(self, side: str, pos_side: str, qty: float, tag: str = "HEDGE") -> Optional[Dict]:
+        cid = self._cid(tag, side, pos_side, 0, qty)
+
+        logging.info("🛡️ MARKET %s %s qty=%.6f %s", side, pos_side, qty, tag)
+
+        if self.cfg.dry_run:
+            # Simular hedges en DRY_RUN
+            if tag.upper() in ("HEDGE-OPEN", "PANIC"):
+                self._hedge_history.append((time.time(), "open", pos_side.upper()))
+                self._active_hedges.append(HedgePosition(
+                    side=pos_side.upper(),
+                    qty=qty,
+                    entry_price=self.c.mark_price(self.cfg.symbol),
+                    entry_time=time.time(),
+                    notional=qty * self.c.mark_price(self.cfg.symbol)
+                ))
+                logging.info("📝 DRY: Hedge simulado")
+            elif tag.upper() == "CLOSE-HEDGE":
+                self._hedge_history.append((time.time(), "close", pos_side.upper()))
+                if self._active_hedges:
+                    self._active_hedges.pop(0)
+                logging.info("📝 DRY: Cierre simulado")
             return None
 
-    def build_grid_orders(self, side_mode: str = "BOTH") -> List[Tuple[str, str, float, float, bool]]:
-        mp = self.c.mark_price(self.cfg.symbol)
-        self.state.center = mp
-        out: List[Tuple[str, str, float, float, bool]] = []
-        for i in range(1, self.cfg.levels_per_side + 1):
-            off = mp * self.cfg.step_pct * i
-            if side_mode in ("BOTH", "SHORT_ONLY"):
-                p = mp + off
-                q = self._qty_from_notional(self.cfg.order_notional, p)
-                out.append(("SELL", "SHORT", p, q, False))
-            if side_mode in ("BOTH", "LONG_ONLY"):
-                p = mp - off
-                q = self._qty_from_notional(self.cfg.order_notional, p)
-                out.append(("BUY", "LONG", p, q, False))
-        return out
+        params = {
+            "symbol": self.cfg.symbol,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": str(qty),
+            "positionSide": pos_side.upper(),
+            "newClientOrderId": cid,
+        }
 
-    def place_grid(self, side_mode: str = "BOTH"):
-        # Reinicia tracking porque estás armando un grid nuevo
-        self._reset_grid_tracking()
-        for side, ps, price, qty, ro in self.build_grid_orders(side_mode):
-            res = self._place_limit(side, ps, price, qty, reduce_only=ro)
-            # Guarda orderIds del GRID (si no estás en dry_run y la orden fue aceptada)
-            if res and isinstance(res, dict) and "orderId" in res:
+        try:
+            res = self.c.new_order(**params)
+            # En live, registra también en historial con lado de la posición hedge
+            if tag.upper() in ("HEDGE-OPEN", "PANIC"):
+                self._hedge_history.append((time.time(), "open", pos_side.upper()))
+            elif tag.upper() == "CLOSE-HEDGE":
+                self._hedge_history.append((time.time(), "close", pos_side.upper()))
+            return res
+        except Exception as e:
+            logging.error("market hedge: %s", e)
+            return None
+
+    def place_take_profit_for_fill(self, entry_side: str, pos_side: str, fill_price: float, qty: float):
+        step = self.cfg.step_pct
+        mp = self.c.mark_price(self.cfg.symbol)
+        ticks = max(1, int(self.cfg.maker_ticks_away))
+        offset = ticks * self.tick_size
+
+        if entry_side.upper() == "BUY":
+            # Cerrar LONG con SELL
+            close_side = "SELL"
+            raw_tp = fill_price * (1 + step)
+
+            # 🔹 TP debe estar por encima del mark para ser maker en SELL
+            min_safe = mp + offset
+            tp_px = max(raw_tp, min_safe)
+        else:
+            # Cerrar SHORT con BUY
+            close_side = "BUY"
+            raw_tp = fill_price * (1 - step)
+
+            # 🔹 TP debe estar por debajo del mark para ser maker en BUY
+            max_safe = mp - offset
+            tp_px = min(raw_tp, max_safe)
+
+        notional = fill_price * qty
+        pnl_gross = notional * step
+        fees_est = notional * 0.0004
+        pnl_net = pnl_gross - fees_est
+        logging.info("PnL esp: gross=$%.2f fees=$%.2f net=$%.2f", pnl_gross, fees_est, pnl_net)
+
+        # Enviamos TP como LIMIT GTX usando el precio maker-safe calculado
+        res = self._place_limit(close_side, pos_side, tp_px, qty, tag="TP")
+        used = self._snap_to_tick(tp_px)
+
+        oid = None
+        if res and isinstance(res, dict) and res.get("orderId"):
+            try:
+                oid = int(res["orderId"])
+            except Exception:
+                pass
+
+        if res or self.cfg.dry_run:
+            self._event(
+                "TP_PLACED",
+                side=close_side,
+                posSide=pos_side,
+                price=round(used, 2),
+                qty=qty,
+                oid=oid,                     # ← agregado
+            )
+
+        else:
+            logging.warning("TP rechazado (GTX post-only)")
+            step = self.cfg.step_pct
+            if entry_side.upper() == "BUY":
+                close_side = "SELL"
+                tp_px = fill_price * (1 + step)
+            else:
+                close_side = "BUY"
+                tp_px = fill_price * (1 - step)
+
+            notional = fill_price * qty
+            pnl_gross = notional * step
+            fees_est = notional * 0.0004
+            pnl_net = pnl_gross - fees_est
+            logging.info("PnL esp: gross=$%.2f fees=$%.2f net=$%.2f", pnl_gross, fees_est, pnl_net)
+
+            res = self._place_limit(close_side, pos_side, tp_px, qty, tag="TP")
+            used = self._snap_to_tick(tp_px)
+
+            oid = None
+            if res and isinstance(res, dict) and res.get("orderId"):
                 try:
-                    self._grid_order_ids.add(int(res["orderId"]))
+                    oid = int(res["orderId"])
                 except Exception:
                     pass
 
-    # -------------------------- Gestión de riesgo -----------------------
+            self._event(
+                "TP_PLACED",
+                side=close_side,
+                posSide=pos_side,
+                price=round(used, 2),
+                qty=qty,
+                oid=oid,                     # ← agregado
+            )
+
+
+            if res is None and not self.cfg.dry_run:
+                logging.warning("TP rechazado")
+
+    def build_grid_orders(self) -> List[Tuple[str, str, float, float]]:
+        mp = self.c.mark_price(self.cfg.symbol)
+        self.state.center = mp
+        out = []
+
+        levels = self.cfg.levels_per_side
+        if self._circuit_level == 1:
+            levels = max(8, levels // 2)
+            logging.info("Circuit L1: %d niveles", levels)
+
+        for i in range(1, levels + 1):
+            off = mp * self.cfg.step_pct * i
+            p_sell = mp + off
+            q_sell = self._qty_from_notional(self.cfg.order_notional, p_sell)
+            out.append(("SELL", "SHORT", p_sell, q_sell))
+
+            p_buy = mp - off
+            q_buy = self._qty_from_notional(self.cfg.order_notional, p_buy)
+            out.append(("BUY", "LONG", p_buy, q_buy))
+        return out
+
+    def _count_same_side_orders_optimized(self, open_orders: List[Dict], side: str, pos_side: str) -> int:
+        return sum(1 for o in open_orders
+                  if o.get("side") == side.upper()
+                  and o.get("positionSide") == pos_side.upper()
+                  and o.get("status") == "NEW")
+
+    def place_grid(self):
+        if self._paused or self._circuit_level >= 2:
+            logging.warning("Grid pausado (panic=%s circuit=%d)", self._paused, self._circuit_level)
+            return
+
+        try:
+            open_orders = self.c.get_open_orders(self.cfg.symbol)
+        except Exception as e:
+            logging.error("Error get_open_orders: %s", e)
+            open_orders = []
+
+        orders = self.build_grid_orders()
+        for side, ps, price, qty in orders:
+            current = self._count_same_side_orders_optimized(open_orders, side, ps)
+            if current >= self.cfg.max_same_side_levels:
+                logging.warning("⚠️ MAX_SAME_SIDE_LEVELS: %s %s (%d/%d)",
+                               side, ps, current, self.cfg.max_same_side_levels)
+                continue
+
+            res = self._place_limit(side, ps, price, qty, tag="GRID")
+            used = self._maker_price(side.upper()=="BUY", price)
+
+            oid = None
+            if res and isinstance(res, dict) and res.get("orderId"):
+                try:
+                    oid = int(res["orderId"])
+                    self._grid_order_ids.add(oid)
+                    self._grid_order_meta[oid] = (
+                        side,
+                        ps,
+                        float(res.get("price", used)),
+                        float(res.get("origQty", qty)),
+                    )
+                except Exception:
+                    pass
+
+            self._event(
+                "GRID_ORDER",
+                side=side,
+                posSide=ps,
+                price=round(used, 2),
+                qty=qty,
+                created=bool(res or self.cfg.dry_run),
+                oid=oid,                     # ← agregado
+            )
+
+
+    # === Métricas diarias ===
+    def _calculate_realized_pnl_today(self, force_refresh: bool = False) -> float:
+        now = time.time()
+
+        if not force_refresh and self._pnl_cache is not None:
+            age = now - self._pnl_cache_time
+            if age < self._pnl_cache_ttl:
+                return self._pnl_cache
+
+        try:
+            now_ms = int(now * 1000)
+            start_ms = int(self._daily_start_time * 1000)
+
+            trades = self.c.user_trades(self.cfg.symbol, start_time=start_ms, end_time=now_ms, limit=1000)
+            total_realized = sum(float(t.get("realizedPnl", 0)) for t in trades)
+
+            income = self.c.income_history(self.cfg.symbol, start_time=start_ms, end_time=now_ms, limit=1000)
+            funding = sum(float(i.get("income", 0)) for i in income if i.get("incomeType") == "FUNDING_FEE")
+
+            total = total_realized + funding
+
+            self._daily_realized_pnl = total_realized
+            self._daily_funding_paid = funding
+
+            self._pnl_cache = total
+            self._pnl_cache_time = now
+
+            return total
+        except Exception as e:
+            logging.error("Error PnL: %s", e)
+            return self._pnl_cache if self._pnl_cache is not None else 0.0
+
+
+    def _snapshot_balance(self):
+        try:
+            acc = self.c.account()
+            bal = float(acc.get("totalWalletBalance", 0.0))
+            avail = float(acc.get("availableBalance", 0.0))
+            init = float(acc.get("totalInitialMargin", 0.0))
+            maint = float(acc.get("totalMaintMargin", 0.0))
+            ratio = (maint / bal) if bal > 0 else 0.0
+            self._event(
+                "BALANCE_SNAPSHOT",
+                balance=round(bal, 2),
+                available=round(avail, 2),
+                init_margin=round(init, 2),
+                maint_margin=round(maint, 2),
+                margin_ratio=round(ratio, 4),
+            )
+        except Exception as e:
+            logging.debug("snapshot_balance: %s", e)
+
+    def _snapshot_daily_pnl(self):
+        pnl = self._calculate_realized_pnl_today(force_refresh=True)
+        self._event(
+            "DAILY_PNL_SNAPSHOT",
+            realized=round(self._daily_realized_pnl, 2),
+            funding=round(self._daily_funding_paid, 2),
+            total=round(pnl, 2),
+        )
+
+    def _init_daily_tracking(self):
+        if self._daily_start_balance is None:
+            try:
+                acc = self.c.account()
+                self._daily_start_balance = float(acc.get("totalWalletBalance", 0))
+                self._daily_start_time = time.time()
+                logging.info("💰 Balance inicial: $%.2f", self._daily_start_balance)
+            except Exception as e:
+                logging.error("Error init: %s", e)
+
+    def _check_daily_reset(self):
+        if time.time() - self._daily_start_time > 86400:
+
+            # 👉 foto final del día antes de resetear contadores
+            try:
+                self._snapshot_daily_pnl()
+                self._snapshot_balance()
+            except Exception:
+                pass
+            logging.info("🔄 Reset diario")
+            try:
+                acc = self.c.account()
+                self._daily_start_balance = float(acc.get("totalWalletBalance", 0))
+                self._daily_start_time = time.time()
+                self._daily_realized_pnl = 0.0
+                self._daily_funding_paid = 0.0
+                self._circuit_level = 0
+                self._pnl_cache = None
+            except Exception as e:
+                logging.error("Error reset: %s", e)
+
+    def _detect_strong_trend(self) -> bool:
+        """Detector SMART-LITE: combina varias señales pero solo con datos locales."""
+        cutoff = time.time() - 4*3600
+        # Señal 1: muchos hedges recientes (proxy de estrés)
+        hedges_recent = sum(1 for h in self._hedge_history if h and h[0] >= cutoff and (len(h) >= 2 and h[1] == "open"))
+        many_hedges = hedges_recent >= self.cfg.max_hedges_per_4h
+
+        # Señal 2: movimiento direccional 4h
+        move_4h = abs(self._price_movement_pct(4.0))
+        strong_move = move_4h >= float(os.getenv("TREND_DRIFT_4H_PCT", "0.025"))
+
+        # Señal 3: consistencia de lado en hedges
+        consist = self._hedge_direction_consistency()
+        same_side = consist >= float(os.getenv("TREND_HEDGE_CONSIST_PCT", "0.70"))
+
+        # Señal 4: volatilidad 5m
+        vol_5m = self._volatility_range_pct(5)
+        high_vol = vol_5m >= float(os.getenv("TREND_VOL_5M_PCT", "0.02"))
+
+        # Trending: requiere many_hedges + al menos N señales adicionales (default 1)
+        min_extra = int(os.getenv("TREND_MIN_EXTRA_CONDS", "1"))
+        met = sum([strong_move, same_side, high_vol])
+        trending = many_hedges and (met >= min_extra)
+
+        if trending:
+            now = time.time()
+            if now - getattr(self, "_last_trending_log_ts", 0) >= 60:
+                logging.warning("⚠️ Trending SMART: hedges=%d move4h=%.2f%% consist=%.0f%% vol5m=%.2f%%",
+                                hedges_recent, move_4h*100, consist*100, vol_5m*100)
+                self._last_trending_log_ts = now
+        return trending
+
+    def _price_movement_pct(self, hours: float = 4.0) -> float:
+        if not self._price_hist_long:
+            return 0.0
+        now = time.time()
+        cutoff = now - hours*3600
+        # tomar el precio más cercano previo al cutoff, o el primero disponible
+        candidates = [(t,p) for t,p in self._price_hist_long if t <= cutoff]
+        if candidates:
+            t0, p0 = candidates[0]
+        else:
+            t0, p0 = self._price_hist_long[0]
+        p1 = self._price_hist_long[-1][1]
+        if p0 <= 0:
+            return 0.0
+        return (p1 - p0) / p0
+
+    def _volatility_range_pct(self, minutes: int = 5) -> float:
+        if not self._price_hist_long:
+            return 0.0
+        now = time.time()
+        cutoff = now - minutes*60
+        window = [p for (t,p) in self._price_hist_long if t >= cutoff]
+        if len(window) < 2:
+            return 0.0
+        hi, lo = max(window), min(window)
+        return (hi - lo) / max(lo, 1e-9)
+
+    def _hedge_direction_consistency(self, window_sec: int = 4*3600) -> float:
+        cutoff = time.time() - window_sec
+        recent = [h for h in self._hedge_history if h and len(h) >= 3 and h[0] >= cutoff and h[1] == "open"]
+        if len(recent) < 2:
+            return 0.0
+        longs = sum(1 for *_, side in recent if str(side).upper() == "LONG")
+        shorts = len(recent) - longs
+        return max(longs, shorts) / len(recent)
+
+    def _check_daily_stop_loss(self):
+        pnl = self._calculate_realized_pnl_today()
+        if pnl <= -self.cfg.daily_stop_loss_usd:
+            logging.error("🚨 STOP LOSS: $%.2f", pnl)
+            self._event("DAILY_STOP", realized_pnl=round(pnl,2))
+            try:
+                self.c.cancel_all_open_orders(self.cfg.symbol)
+            except Exception as e:
+                logging.error("Error: %s", e)
+            self._paused = True
+            self._circuit_level = 2
+            logging.error("Bot pausado hasta reset diario")
+
+    def _check_circuit_breaker(self):
+        pnl = self._calculate_realized_pnl_today()
+        if pnl <= -self.cfg.circuit_breaker_loss_l2:
+            if self._circuit_level < 2:
+                logging.error("🔴 CIRCUIT L2: $%.2f", pnl)
+                self._event("CIRCUIT_L2", pnl=round(pnl,2))
+                try:
+                    self.c.cancel_all_open_orders(self.cfg.symbol)
+                    self._grid_order_ids.clear()
+                    self._grid_order_meta.clear()
+                except Exception as e:
+                    logging.error("Error: %s", e)
+                self._circuit_level = 2
+        elif pnl <= -self.cfg.circuit_breaker_loss_l1:
+            if self._circuit_level < 1:
+                logging.warning("⚠️ CIRCUIT L1: $%.2f", pnl)
+                self._event("CIRCUIT_L1", pnl=round(pnl,2))
+                self._circuit_level = 1
+                try:
+                    self.c.cancel_all_open_orders(self.cfg.symbol)
+                    self._grid_order_ids.clear()
+                    self._grid_order_meta.clear()
+                    self.place_grid()
+                except Exception as e:
+                    logging.error("Error: %s", e)
+        elif pnl > -100 and self._circuit_level > 0:
+            logging.info("✅ Circuit reset")
+            self._event("CIRCUIT_RESET")
+            self._circuit_level = 0
+            try:
+                self.c.cancel_all_open_orders(self.cfg.symbol)
+                self._grid_order_ids.clear()
+                self._grid_order_meta.clear()
+                self.place_grid()
+            except Exception as e:
+                logging.error("Error: %s", e)
 
     def net_exposure_notional(self) -> float:
         pr = self.c.get_position_risk(self.cfg.symbol)
         mp = self.c.mark_price(self.cfg.symbol)
-        long_n = 0.0
-        short_n = 0.0
-        for p in pr:
-            side = p.get("positionSide")
-            qty = float(p.get("positionAmt", 0.0))
-            if qty == 0:
-                continue
-            if side == "LONG" and qty > 0:
-                long_n += qty * mp
-            elif side == "SHORT" and qty < 0:
-                short_n += abs(qty) * mp
+        long_n = sum(abs(float(p.get("positionAmt", 0))) * mp for p in pr if p.get("positionSide") == "LONG")
+        short_n = sum(abs(float(p.get("positionAmt", 0))) * mp for p in pr if p.get("positionSide") == "SHORT")
         return long_n - short_n
+
+    def _calculate_hedge_fraction(self, drift: float) -> float:
+        h = self.cfg.hedge_on_drift_pct
+        h_ratio = drift / h if h > 0 else 0
+        frac = self.cfg.hedge_fraction_min + 0.4 * h_ratio
+        return min(frac, self.cfg.hedge_fraction_max)
+
+    def _open_hedge_position(self, net_n: float, drift: float):
+        mp = self.c.mark_price(self.cfg.symbol)
+        hedge_frac = self._calculate_hedge_fraction(drift)
+        hedge_notional = abs(net_n) * hedge_frac
+
+        # 🔹 Evitar el ValueError por debajo del mínimo de Binance
+        if hedge_notional < self.min_notional:
+            logging.info(
+                "Hedge demasiado pequeño, lo salto: notional=%.2f < minNotional=%.2f",
+                hedge_notional,
+                self.min_notional,
+            )
+            return
+
+        qty = self._qty_from_notional(hedge_notional, mp)
+
+        if net_n > 0:
+            logging.info(
+                "🛡️ HEDGE: net LONG → abre SHORT qty=%.6f (%.1f%%)",
+                qty,
+                hedge_frac * 100,
+            )
+            res = self._place_market_hedge("SELL", "SHORT", qty, tag="HEDGE-OPEN")
+            self._event(
+                "HEDGE_OPEN",
+                net_n=round(net_n, 2),
+                drift=round(drift, 4),
+                hedge_frac=round(hedge_frac, 3),
+                qty=qty,
+                side="SELL",
+                posSide="SHORT",
+            )
+            if res or self.cfg.dry_run:
+                if not self.cfg.dry_run:
+                    self._active_hedges.append(
+                        HedgePosition(
+                            side="SHORT",
+                            qty=qty,
+                            entry_price=mp,
+                            entry_time=time.time(),
+                            notional=hedge_notional,
+                        )
+                    )
+        else:
+            logging.info(
+                "🛡️ HEDGE: net SHORT → abre LONG qty=%.6f (%.1f%%)",
+                qty,
+                hedge_frac * 100,
+            )
+            res = self._place_market_hedge("BUY", "LONG", qty, tag="HEDGE-OPEN")
+            self._event(
+                "HEDGE_OPEN",
+                net_n=round(net_n, 2),
+                drift=round(drift, 4),
+                hedge_frac=round(hedge_frac, 3),
+                qty=qty,
+                side="BUY",
+                posSide="LONG",
+            )
+            if res or self.cfg.dry_run:
+                if not self.cfg.dry_run:
+                    self._active_hedges.append(
+                        HedgePosition(
+                            side="LONG",
+                            qty=qty,
+                            entry_price=mp,
+                            entry_time=time.time(),
+                            notional=hedge_notional,
+                        )
+                    )
+
+            
+
+    def _close_hedge_positions(self):
+        if not self._active_hedges:
+            return
+        mp = self.c.mark_price(self.cfg.symbol)
+        for hedge in self._active_hedges[:]:
+            if hedge.side == "SHORT":
+                pnl = hedge.notional * (hedge.entry_price - mp) / hedge.entry_price
+                close_side = "BUY"
+            else:
+                pnl = hedge.notional * (mp - hedge.entry_price) / hedge.entry_price
+                close_side = "SELL"
+            logging.info("✅ Cerrando %s: PnL=$%.2f", hedge.side, pnl)
+            self._event("HEDGE_CLOSE", side=hedge.side, qty=hedge.qty, entry=round(hedge.entry_price,2), exit=round(mp,2), pnl=round(pnl,2))
+            res = self._place_market_hedge(close_side, hedge.side, hedge.qty, tag="CLOSE-HEDGE")
+            if res or self.cfg.dry_run:
+                self._active_hedges.remove(hedge)
 
     def maybe_hedge_and_recenter(self):
         mp = self.c.mark_price(self.cfg.symbol)
-        drift = abs(mp - self.state.center) / max(self.state.center, 1e-9)
+        drift = abs(mp - self.state.center) / self.state.center
         net_n = self.net_exposure_notional()
         gross_grid_n = self.cfg.order_notional * self.cfg.levels_per_side * 2
-        need = (drift >= self.cfg.hedge_on_drift_pct) or (abs(net_n) >= self.cfg.hedge_on_net_fraction * gross_grid_n)
-        if not need:
+
+        if self._active_hedges and drift < 0.005:
+            logging.info("📍 Precio regresó, cerrando hedges")
+            self._close_hedge_positions()
+
+        need_hedge = (drift >= self.cfg.hedge_on_drift_pct) or (abs(net_n) >= self.cfg.hedge_on_net_fraction * gross_grid_n)
+        need_recenter_full = drift >= self.cfg.recenter_drift_full
+        need_recenter_partial = drift >= self.cfg.recenter_drift_partial
+
+        if not (need_hedge or need_recenter_full or need_recenter_partial):
             return
-        logging.info("Recentrar/hedge: drift=%.3f net=%.2f / gross=%.2f", drift, net_n, gross_grid_n)
+        
+        now = time.time()
+        if now - getattr(self, "_last_drift_log_ts", 0) >= 30:  
+            logging.info("⚡ drift=%.3f%% net=$%.2f", drift*100, net_n)
+            self._last_drift_log_ts = now
 
-        # 1) Cancelar órdenes viejas (mantenemos posiciones)
-        self.c.cancel_all_open_orders(self.cfg.symbol)
-        self._reset_grid_tracking()
 
-        # 2) Hedge según modo (por defecto REDUCE)
-        if abs(net_n) > 0:
-            qty = self._qty_from_notional(abs(net_n), mp)
-            if self.cfg.hedge_mode == "OFFSET":
-                if net_n > 0:
-                    self._place_limit("SELL", "SHORT", mp, qty, reduce_only=False, tag="hedge-offset")
-                else:
-                    self._place_limit("BUY", "LONG", mp, qty, reduce_only=False, tag="hedge-offset")
-            else:
-                if net_n > 0:
-                    self._place_limit("SELL", "LONG", mp, qty, reduce_only=True, tag="hedge-reduce")
-                else:
-                    self._place_limit("BUY", "SHORT", mp, qty, reduce_only=True, tag="hedge-reduce")
-
-        # 3) Recentrar y reponer grid
-        self.state.center = mp
-        self.state.last_recenter_ts = time.time()
-        self.place_grid(side_mode="BOTH")
-
-    def kill_switch_if_needed(self):
-        if self.cfg.dry_run:
-            return
-        acc = self.c.account()
-        bal = float(acc.get("totalWalletBalance", 0.0))
-        maint = float(acc.get("totalMaintMargin", 0.0))
-        ratio = (maint / bal) if bal else 0.0
-        if ratio >= self.cfg.max_margin_ratio:
-            logging.error("KILL-SWITCH: ratio %.2f ≥ %.2f", ratio, self.cfg.max_margin_ratio)
-            # Cancelación “amplia”
-            self.c.cancel_all_open_orders(self.cfg.symbol)
-            # Barrido defensivo por si quedara alguna stop/oco colgada
+        if need_recenter_full:
+            hedges_before = len(self._active_hedges)
+            logging.warning("🔄 RECENTRADO COMPLETO (hedges: %d)", hedges_before)
+            self._event("RECENTER_FULL", old_center=round(self.state.center,2), new_center=round(mp,2), drift=round(drift,4))
             try:
-                oo_left = self.c.get_open_orders(self.cfg.symbol)
-                for o in oo_left:
-                    try:
-                        self.c.cancel_order(self.cfg.symbol, int(o["orderId"]))
-                    except Exception as e:
-                        logging.warning("cancel residual %s err: %s", o.get("orderId"), e)
+                self.c.cancel_all_open_orders(self.cfg.symbol)
             except Exception as e:
-                logging.warning("post-cancel openOrders err: %s", e)
+                logging.warning("cancel: %s", e)
+            self._grid_order_ids.clear()
+            self._grid_order_meta.clear()
+            if abs(net_n) > 0 and not self._detect_strong_trend():
+                self._open_hedge_position(net_n, drift)
+            self.state.center = mp
+            self.state.last_recenter_ts = time.time()
+            self.place_grid()
+            hedges_after = len(self._active_hedges)
+            logging.info("Hedges post-recenter: %d (antes: %d)", hedges_after, hedges_before)
+            return
 
-            # Reduce neto
-            net_n = self.net_exposure_notional()
-            if abs(net_n) > 0:
+        if need_recenter_partial:
+            hedges_before = len(self._active_hedges)
+            logging.warning("🔄 RECENTRADO PARCIAL (hedges: %d)", hedges_before)
+            old_center = self.state.center
+            self.state.center = (old_center + mp) / 2
+            self._event("RECENTER_PARTIAL", old_center=round(old_center,2), new_center=round(self.state.center,2), drift=round(drift,4))
+            logging.info("Centro: %.2f → %.2f", old_center, self.state.center)
+            try:
+                self.c.cancel_all_open_orders(self.cfg.symbol)
+            except Exception as e:
+                logging.warning("cancel: %s", e)
+            self._grid_order_ids.clear()
+            self._grid_order_meta.clear()
+            if abs(net_n) > 0 and not self._detect_strong_trend():
+                self._open_hedge_position(net_n, drift)
+            self.state.last_recenter_ts = time.time()
+            self.place_grid()
+            hedges_after = len(self._active_hedges)
+            logging.info("Hedges post-recenter: %d (antes: %d)", hedges_after, hedges_before)
+            return
+
+        if need_hedge and abs(net_n) > 0:
+            if self._detect_strong_trend():
+                # Anti-spam: el warning se emite dentro de _detect_strong_trend con rate-limit
+                return
+            logging.info("🛡️ Hedge")
+            self._open_hedge_position(net_n, drift)
+
+    def _check_funding_rate(self):
+        try:
+            info = self.c.premium_index(self.cfg.symbol)
+            rate = abs(float(info.get("lastFundingRate", 0)))
+            if rate >= self.cfg.funding_rate_warn_8h:
+                pr = self.c.get_position_risk(self.cfg.symbol)
                 mp = self.c.mark_price(self.cfg.symbol)
-                qty = self._qty_from_notional(abs(net_n), mp)
+                total = sum(abs(float(p.get("positionAmt", 0))) * mp for p in pr)
+                cost = total * rate
+                logging.warning("⚠️ Funding: %.4f%%", rate*100)
+                logging.warning("Costo: $%.2f/periodo", cost)
+                self._event("FUNDING_WARN", rate=rate, est_cost=round(cost,2))
+                if abs(self._daily_funding_paid) >= self.cfg.funding_fee_warn_usd:
+                    logging.error("🚨 Funding hoy: $%.2f", abs(self._daily_funding_paid))
+        except Exception as e:
+            logging.debug("Error funding: %s", e)
+
+    def _check_panic_mode(self):
+        mp = self.c.mark_price(self.cfg.symbol)
+        now = time.time()
+        # Ventana corta (5m) para pánico
+        self._price_history_5m.append((now, mp))
+        self._price_history_5m = [(t, p) for t, p in self._price_history_5m if t >= now - 300]
+        # Ventana larga (4h) para trending
+        self._price_hist_long.append((now, mp))
+        cut_long = now - 4*3600
+        self._price_hist_long = [(t, p) for t, p in self._price_hist_long if t >= cut_long]
+
+        if len(self._price_history_5m) < 2:
+            return
+
+        oldest = self._price_history_5m[0][1]
+        change = abs(mp - oldest) / oldest
+
+        if change >= self.cfg.panic_range_5m_pct and not self._paused:
+            logging.error("🚨 PÁNICO: %.2f%%/5min", change*100)
+            self._paused = True
+            self._stable_blocks = 0
+            self._event("PANIC_ON", change_5m=round(change,4))
+            try:
+                self.c.cancel_all_open_orders(self.cfg.symbol)
+                self._grid_order_ids.clear()
+                self._grid_order_meta.clear()
+            except Exception as e:
+                logging.error("Error: %s", e)
+            net_n = self.net_exposure_notional()
+            if abs(net_n) > 0 and not self._detect_strong_trend():
+                hedge_n = abs(net_n) * self.cfg.hedge_fraction_max
+                qty = self._qty_from_notional(hedge_n, mp)
                 if net_n > 0:
-                    self._place_limit("SELL", "LONG", mp, qty, reduce_only=True, tag="hedge-kill")   # reduce LONG
+                    logging.warning("PÁNICO: net LONG → hedge SHORT")
+                    self._event("PANIC_HEDGE", side="SELL", posSide="SHORT", qty=qty)
+                    self._place_market_hedge("SELL", "SHORT", qty, tag="PANIC")
                 else:
-                    self._place_limit("BUY", "SHORT", mp, qty, reduce_only=True, tag="hedge-kill")  # reduce SHORT
-            raise SystemExit("Detenido por seguridad")
+                    logging.warning("PÁNICO: net SHORT → hedge LONG")
+                    self._event("PANIC_HEDGE", side="BUY", posSide="LONG", qty=qty)
+                    self._place_market_hedge("BUY", "LONG", qty, tag="PANIC")
+        elif self._paused and change < self.cfg.unpause_range_5m_pct:
+            self._stable_blocks += 1
+            if self._stable_blocks >= self.cfg.unpause_stable_blocks:
+                logging.info("✅ Reanudando")
+                self._event("PANIC_OFF")
+                self._paused = False
+                self._stable_blocks = 0
+                self.place_grid()
+        elif self._paused and change >= self.cfg.unpause_range_5m_pct:
+            self._stable_blocks = 0
 
-    # ----------------------- Auto-TP via /userTrades ---------------------
-
-    def bootstrap_last_trade_id(self):
-        """Ancla _last_trade_id al último trade existente para NO procesar históricos."""
+    def _bootstrap_last_trade_id(self):
         try:
             trades = self.c.user_trades(self.cfg.symbol, limit=1)
             if trades:
                 self._last_trade_id = int(trades[-1]["id"])
-                logging.info("Bootstrap last_trade_id=%s (saltando históricos)", self._last_trade_id)
-            else:
-                self._last_trade_id = -1
+                logging.info("Bootstrap: %s", self._last_trade_id)
         except Exception as e:
-            logging.warning("bootstrap_last_trade_id err: %s", e)
-            self._last_trade_id = -1
+            logging.warning("bootstrap: %s", e)
 
     def fetch_new_fills(self) -> List[Dict]:
-        """
-        Lee trades recientes y devuelve solo los nuevos (posteriores a _last_trade_id),
-        filtrando para procesar SOLO fills de órdenes del GRID (por orderId).
-        NO actualiza _last_trade_id aquí (se hace en el loop principal tras procesar).
-        """
+        from_id = self._last_trade_id + 1 if self._last_trade_id is not None else None
         try:
-            if self._last_trade_id is None:
-                self.bootstrap_last_trade_id()
-                return []
-            trades = self.c.user_trades(self.cfg.symbol, limit=50, from_id=(self._last_trade_id + 1))
-            trades = sorted(trades, key=lambda x: int(x["id"]))
-            out: List[Dict] = []
-            for tr in trades:
-                tid = int(tr["id"])
-                if tid <= self._last_trade_id:
-                    continue
-                try:
-                    oid = int(tr.get("orderId", -1))
-                    if oid in self._grid_order_ids:
-                        out.append(tr)
-                except Exception:
-                    pass
-            return out
+            fills = self.c.user_trades(self.cfg.symbol, from_id=from_id, limit=1000)
         except Exception as e:
-            logging.warning("fetch_new_fills err: %s", e)
+            logging.warning("user_trades: %s", e)
             return []
 
-    # ------------------------- Simulador (dry-run) -----------------------
+        out = []
+        for tr in fills:
+            try:
+                oid = int(tr.get("orderId", -1))
+                if oid in self._grid_order_ids:
+                    out.append(tr)
+                    self._grid_order_ids.discard(oid)
+            except Exception:
+                pass
+        return out
 
-    def simulate_fills_against_grid(self):
-        """
-        Simula fills si el mark cruza niveles del grid (solo dry-run y si DRY_RUN_SIM=1).
-        Usa un set para evitar TPs duplicados en el mismo nivel.
-        """
-        if not self.cfg.dry_run or not self.cfg.dry_run_sim:
-            return
+    def _get_timestop_hours(self) -> float:
         mp = self.c.mark_price(self.cfg.symbol)
-        step = self.cfg.step_pct
-        levels = []
-        for i in range(1, self.cfg.levels_per_side + 1):
-            levels.append(("SELL", "SHORT", self.state.center * (1 + step * i)))
-            levels.append(("BUY", "LONG",  self.state.center * (1 - step * i)))
-        for side, ps, p in levels:
-            key = (side, round(p, 2))
-            if key in self._simulated_fills:
-                continue
-            if (side == "BUY" and mp <= p) or (side == "SELL" and mp >= p):
-                self._simulated_fills.add(key)
-                q = self._qty_from_notional(self.cfg.order_notional, p)
-                logging.info("SIM FILL %s %s qty=%.6f @ %.2f", side, ps, q, p)
-                self.place_take_profit_for_fill(side, ps, p, q)
+        drift = abs(mp - self.state.center) / self.state.center
+        return self.cfg.timestop_hours_fast if drift >= self.cfg.drift_fast_pct else self.cfg.timestop_hours_base
 
-    # -------------------------------- Loop --------------------------------
+    def _stale_orders(self, hours: float) -> List[int]:
+        if hours <= 0:
+            return []
+        try:
+            oo = self.c.get_open_orders(self.cfg.symbol)
+        except Exception as e:
+            logging.warning("Error al obtener órdenes abiertas: %s", e)
+            return []
+        now = time.time()
+        stale = []
+        for o in oo:
+            try:
+                t_raw = o.get("time") or o.get("updateTime")
+                if not t_raw:
+                    continue
+                t = float(t_raw) / 1000.0
+                if t <= 0 or t > now:
+                    continue
+                age_hours = (now - t) / 3600.0
+                if age_hours >= hours:
+                    order_id = int(o["orderId"])
+                    stale.append(order_id)
+            except Exception:
+                continue
+        return stale
+
+    def _rearm_order_from_meta(self, oid: int):
+        meta = self._grid_order_meta.get(oid)
+        if not meta:
+            return
+        side, ps, price, qty = meta
+        used = self._maker_price(side.upper()=="BUY", price)
+        res = self._place_limit(side, ps, price, qty, tag="REGEN")
+
+        new_id = None
+        if res and isinstance(res, dict) and res.get("orderId"):
+            try:
+                new_id = int(res["orderId"])
+                self._grid_order_ids.add(new_id)
+                self._grid_order_meta[new_id] = (
+                    side, ps,
+                    float(res.get("price", used)),
+                    float(res.get("origQty", qty))
+                )
+                self._grid_order_meta.pop(oid, None)
+            except Exception:
+                pass
+
+        self._event(
+            "GRID_ORDER",
+            side=side,
+            posSide=ps,
+            price=round(used, 2),
+            qty=qty,
+            tag="REGEN",
+            rearmOf=oid,
+            created=bool(res or self.cfg.dry_run),
+            oid=new_id,                 # ← agregado (id de la nueva orden)
+        )
+
+
+    def print_status(self):
+        try:
+            acc = self.c.account()
+            bal = float(acc.get("totalWalletBalance", 0))
+            margin = float(acc.get("totalInitialMargin", 0))
+            upnl = float(acc.get("totalUnrealizedProfit", 0))
+            print(f"""
+╔══════════════════════════════════════════╗
+║   Grid Bot SMART - {self.cfg.symbol}           ║
+╠══════════════════════════════════════════╣
+║ Balance:      ${bal:>12,.2f}          ║
+║ Margin:       ${margin:>12,.2f} ({(margin/bal*100 if bal else 0):>5.1f}%) ║
+║ UPnL:         ${upnl:>12,.2f}          ║
+║ PnL hoy:      ${self._daily_realized_pnl:>12,.2f}          ║
+║ Funding:      ${self._daily_funding_paid:>12,.2f}          ║
+╠══════════════════════════════════════════╣
+║ Grid:         {len(self._grid_order_ids):>4}                     ║
+║ Hedges:       {len(self._active_hedges):>4}                     ║
+║ Circuit:      L{self._circuit_level}                       ║
+║ Pánico:       {'SÍ' if self._paused else 'NO':>4}                     ║
+╚══════════════════════════════════════════╝
+            """)
+        except Exception:
+            pass
 
     def preflight(self):
         if not self.cfg.api_key or not self.cfg.api_secret:
-            raise RuntimeError("Faltan BINANCE_API_KEY/SECRET")
+            raise RuntimeError("Faltan credenciales")
         try:
-            self.c.change_position_mode(True)  # Hedge mode
+            self.c.change_position_mode(True)
+            logging.info("✓ Hedge mode")
         except Exception as e:
-            logging.warning("position mode: %s", e)
+            logging.info("position mode: %s", e)
         try:
             self.c.change_leverage(self.cfg.symbol, self.cfg.leverage)
+            logging.info("✓ Leverage: %dx", self.cfg.leverage)
         except Exception as e:
-            logging.warning("leverage: %s", e)
+            logging.info("leverage: %s", e)
         try:
             self.c.change_margin_type(self.cfg.symbol, self.cfg.margin_mode)
+            logging.info("✓ Margin: %s", self.cfg.margin_mode)
         except Exception as e:
-            logging.warning("margin type: %s", e)
-        logging.info("Centro inicial: %.2f", self.state.center)
-        # Evita TPs por histórico:
-        self.bootstrap_last_trade_id()
+            logging.info("margin: %s", e)
+        logging.info("Centro: %.2f", self.state.center)
+        self._init_daily_tracking()
 
     def run(self):
         self.preflight()
-        self.place_grid(side_mode="BOTH")
-        logging.info("Grid inicial colocado")
+        self.place_grid()
+        logging.info("✓ Grid inicial")
+        self._bootstrap_last_trade_id()
 
+        backoff = 2.0
         err_count = 0
+        loop_count = 0
+
         while True:
             try:
-                # Seguridad
+                loop_count += 1
+
+                self._check_daily_reset()
                 self.kill_switch_if_needed()
+                self._check_daily_stop_loss()
+                self._check_circuit_breaker()
+                self._check_panic_mode()
 
-                # Gestión de grid/hedge
-                self.maybe_hedge_and_recenter()
+                if loop_count % 20 == 0:
+                    self._check_funding_rate()
 
-                # Auto-TP por FILLS reales (solo grid)
-              
+                if not self._paused and self._circuit_level < 2:
+                    self.maybe_hedge_and_recenter()
+
                 fills = self.fetch_new_fills()
-                max_ok_id = None
-                for tr in fills:
+                if fills:
+                    for tr in fills:
+                        side = tr.get("side", "").upper()
+                        ps = tr.get("positionSide", "").upper() or ("LONG" if side == "BUY" else "SHORT")
+                        px = float(tr.get("price", 0.0))
+                        qty = float(tr.get("qty", 0.0))
+
+                        # ← EXTRAER orderId del trade para trazabilidad
+                        oid = None
+                        try:
+                            if "orderId" in tr and tr["orderId"] is not None:
+                                oid = int(tr["orderId"])
+                        except Exception:
+                            pass
+
+                        logging.info("✓ FILL: %s %s %.6f@%.2f (oid=%s)", side, ps, qty, px, oid)
+
+                        # ← Incluir oid en el evento
+                        self._event("FILL", side=side, posSide=ps, qty=qty, fill_price=round(px, 2), oid=oid)
+
+                        # TP igual que antes
+                        self.place_take_profit_for_fill(side, ps, px, qty)
+
+                    # avanzar _last_trade_id como ya haces
                     try:
-                        side = tr.get("side", "").upper()      # BUY/SELL de la ORDEN
-                        qty  = float(tr.get("qty", "0"))
-                        px   = float(tr.get("price", "0"))
-                        if not qty or not px:
-                            continue
-                        # Solo grid → inferencia es correcta
-                        pos_side = "LONG" if side == "BUY" else "SHORT"
-                        logging.info("FILL DETECTED: id=%s orderId=%s side=%s qty=%s px=%s",
-                                    tr.get("id"), tr.get("orderId"), side, qty, px)
-                        
-                        # ✅ NUEVA LÍNEA: guarda el resultado del TP
-                        tp_result = self.place_take_profit_for_fill(side, pos_side, px, qty)
-                        
-                        # ✅ NUEVA LÓGICA: solo marca como procesado si el TP se colocó
-                        if tp_result is not None or self.cfg.dry_run:
-                            # TP exitoso O estamos en dry-run (donde tp_result siempre es None)
-                            max_ok_id = int(tr["id"])
-                        else:
-                            # TP falló (rechazado por Binance)
-                            logging.warning(
-                                "TP falló para fill id=%s (orderId=%s). Reintentará en próximo ciclo.",
-                                tr.get("id"), tr.get("orderId")
-                            )
-                            # NO actualizar max_ok_id → este fill se re-procesará
-                            
+                        self._last_trade_id = int(fills[-1]["id"])
                     except Exception as e:
-                        logging.exception("error procesando fill id=%s: %s", tr.get("id"), e)
+                        logging.error("Error last_trade_id: %s", e)
 
-                if max_ok_id is not None:
-                    self._last_trade_id = max_ok_id
 
-                # Re-arma SOLO órdenes vencidas por time-stop (cancelación selectiva + reponer)
-                oo = self.c.get_open_orders(self.cfg.symbol)
-                now = time.time()
-
-                stale_orders = []
-                open_ids = set()
-                for o in oo:
-                    try:
-                        open_ids.add(int(o["orderId"]))
-                    except Exception:
-                        pass
-                    t = (o.get("time") or o.get("updateTime") or 0) / 1000.0
-                    if t and (now - t) / 3600.0 >= self.cfg.time_stop_hours:
-                        stale_orders.append(o)
-
-                for o in stale_orders:
-                    oid = int(o["orderId"])
-                    side = o.get("side", "BUY").upper()
-                    pos_side = o.get("positionSide", "BOTH").upper()
-                    price = float(o.get("price", "0"))
-                    # cantidad restante si hubo parcial
-                    try:
-                        orig_qty = float(o.get("origQty", "0"))
-                        exec_qty = float(o.get("executedQty", o.get("cumQty", "0")))
-                        qleft = max(orig_qty - exec_qty, 0.0) if orig_qty else 0.0
-                    except Exception:
-                        qleft = float(o.get("origQty", "0")) or 0.0
-
-                    try:
-                        self.c.cancel_order(self.cfg.symbol, oid)
-                        self._grid_order_ids.discard(oid)
-                    except Exception as e:
-                        logging.warning("cancel stale %s err: %s", oid, e)
-                        continue
-
-                    if qleft > 0:
-                        res = self._place_limit(side, pos_side, price, qleft, reduce_only=False, tag="regen-time")
-                        if res and "orderId" in res:
+                if not self._paused and self._circuit_level < 2:
+                    ts_h = self._get_timestop_hours()
+                    stale = self._stale_orders(ts_h)
+                    if stale:
+                        logging.info("Time-stop: %d (>%.1fh)", len(stale), ts_h)
+                        for oid in stale:
                             try:
-                                self._grid_order_ids.add(int(res["orderId"]))
-                            except Exception:
-                                pass
+                                self.c.cancel_order(self.cfg.symbol, oid)
+                                self._grid_order_ids.discard(oid)
+                                if self.cfg.time_stop_cancel_only:
+                                    self._grid_order_meta.pop(oid, None)
+                                else:
+                                    self._rearm_order_from_meta(oid)
+                            except Exception as e:
+                                logging.warning("cancel/rearm: %s", e)
+                                self._grid_order_meta.pop(oid, None)
 
-                # Poda defensiva del set contra órdenes realmente abiertas
-                try:
-                    oo2 = self.c.get_open_orders(self.cfg.symbol)
-                    still_open = {int(x["orderId"]) for x in oo2}
-                    self._grid_order_ids.intersection_update(still_open)
-                except Exception as e:
-                    logging.warning("prune grid ids err: %s", e)
-
-                # Simulador (solo si DRY_RUN_SIM=1)
-                self.simulate_fills_against_grid()
-
-                # éxito → resetea backoff
+                backoff = 2.0
                 err_count = 0
+                # Snapshots cada hora (sincronizado por tiempo, no por número de loops)
+                now = time.time()
+                if not hasattr(self, "_last_snapshot_ts"):
+                    self._last_snapshot_ts = 0.0
+                if now - self._last_snapshot_ts >= self.cfg.snapshot_freq_min * 60:
+                    self._snapshot_balance()
+                    self._snapshot_daily_pnl()
+                    self._last_snapshot_ts = now
+
                 time.sleep(2)
 
+            except KeyboardInterrupt:
+                logging.info("Detenido")
+                break
+            except SystemExit:
+                raise
             except Exception as e:
                 err_count += 1
-                delay = min(60, 2 ** min(err_count, 5))  # 2,4,8,16,32,32,... tope 60
-                logging.exception("Loop error (%s). Backoff %ss", e, delay)
-                time.sleep(delay)
+                logging.error("Loop error (%s). Backoff %.0fs", e, backoff)
+                time.sleep(backoff + random.uniform(0, 0.5*backoff))
+                backoff = min(backoff * 2, 60.0)
+                if err_count >= 8:
+                    logging.warning("Recreando sesión...")
+                    try:
+                        self.c.recreate_session()
+                    except Exception:
+                        pass
+                    err_count = 0
 
-# ================================== Main =======================================
+    def kill_switch_if_needed(self):
+        if self.cfg.dry_run:
+            return
+        try:
+            acc = self.c.account()
+            bal = float(acc.get("totalWalletBalance", 0.0))
+            maint = float(acc.get("totalMaintMargin", 0.0))
+            avail = float(acc.get("availableBalance", 0.0))
+            ratio = (maint / bal) if bal > 0 else 0.0
+            if ratio >= self.cfg.max_margin_ratio or avail < self.cfg.min_available_balance_usd:
+                logging.error("🚨 KILL-SWITCH: ratio=%.2f%% avail=$%.2f", ratio*100, avail)
+                self._event("KILL_SWITCH", margin_ratio=round(ratio,4), available=round(avail,2))
+                try:
+                    self.c.cancel_all_open_orders(self.cfg.symbol)
+                except Exception as e:
+                    logging.error("Error: %s", e)
+                try:
+                    pr = self.c.get_position_risk(self.cfg.symbol)
+                    for p in pr:
+                        ps = p.get("positionSide", "")
+                        qty = abs(float(p.get("positionAmt", 0)))
+                        if qty > 0:
+                            side = "SELL" if ps == "LONG" else "BUY"
+                            logging.error("Cerrando %s: %.6f", ps, qty)
+                            self.c.new_order(symbol=self.cfg.symbol, side=side, type="MARKET", quantity=str(qty), positionSide=ps)
+                except Exception as e:
+                    logging.error("Error: %s", e)
+                raise SystemExit("Kill-switch")
+        except SystemExit:
+            raise
+        except Exception as e:
+            logging.error("Error kill_switch: %s", e)
+
+# =========================
+#  MAIN + LOGGING A ARCHIVOS
+# =========================
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Logging a archivos (rotación diaria)
+    log_dir = os.getenv("LOG_DIR", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    # 1) Log humano rotado diario
+    human_handler = TimedRotatingFileHandler(
+    os.path.join(log_dir, "runtime.log"),
+    when="midnight",
+    backupCount=14,
+    encoding="utf-8",
+    utc=False  # rotar a medianoche LOCAL
+)
+
+    # Usar hora local (por defecto logging usa time.localtime)
+    human_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    human_handler.setFormatter(human_fmt)
+    logging.getLogger().addHandler(human_handler)
+
+
+    # 2) Log estructurado JSONL rotado diario
+    events_logger = logging.getLogger("events")
+    events_logger.setLevel(logging.INFO)
+    events_handler = TimedRotatingFileHandler(os.path.join(log_dir, "events.jsonl"), when="midnight", backupCount=14, encoding="utf-8", utc=False)
+    events_handler.setFormatter(logging.Formatter("%(message)s"))
+    events_logger.addHandler(events_handler)
+    events_logger.propagate = False  # evita duplicar eventos en runtime.log
+
+    RUN_ID = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    logging.info("Logging iniciado. RUN_ID=%s  log_dir=%s", RUN_ID, log_dir)
+
     cfg = Config.from_env()
-    client = SdkClient(cfg)  # usa SDK si existe; si no, REST
+
+    print("="*70)
+    print("Grid Hedge Bot - SMART TRENDING + LOGGING")
+    print("="*70)
+    print(f"Symbol: {cfg.symbol}")
+    print(f"Levels: {cfg.levels_per_side} | Step: {cfg.step_pct*100:.2f}%")
+    print(f"Notional: ${cfg.order_notional:,.0f} | Leverage: {cfg.leverage}x")
+    print(f"Modo: {'🟢 DRY RUN' if cfg.dry_run else '🔴 LIVE'}")
+    print(f"URL: {cfg.base_url}")
+    print("="*70)
+
+    if cfg.dry_run:
+        print("⚠️  DRY RUN ACTIVADO - Sin órdenes reales")
+    else:
+        print("🔴 MODO LIVE - ÓRDENES REALES • Iniciando en 5s...")
+        time.sleep(5)
+
+    client = RestClient(cfg)
     bot = GridHedgeBot(client, cfg)
-    bot.run()
+
+    try:
+        bot.run()
+    except KeyboardInterrupt:
+        print("\n✓ Bot detenido por usuario")
+    except Exception as e:
+        logging.exception("Error fatal: %s", e)
+        raise

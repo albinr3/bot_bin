@@ -1,0 +1,2 @@
+{"ts":"2025-11-12T02:09:24-04:00","run_id":"20251112T022453Z","symbol":"BTCUSDC","event":"FILL","mp":103468.1,"center":103283.53,"circuit":0,"paused":false,"side":"SELL","posSide":"SHORT","qty":0.003,"fill_price":103438.6}
+{"ts":"2025-11-12T02:09:25-04:00","run_id":"20251112T022453Z","symbol":"BTCUSDC","event":"TP_PLACED","mp":103468.1,"center":103283.53,"circuit":0,"paused":false,"side":"BUY","posSide":"SHORT","price":103283.4,"qty":0.003}
