@@ -397,6 +397,8 @@ def utcnow():
 
 class GridHedgeBot:
     def __init__(self, client: FuturesClient, cfg: Config):
+        self._last_drift_print = None
+
         self.c = client
         self.cfg = cfg
         self.state = GridState(center=self.c.mark_price(cfg.symbol), last_recenter_ts=time.time())
@@ -619,87 +621,54 @@ class GridHedgeBot:
         offset = ticks * self.tick_size
 
         if entry_side.upper() == "BUY":
-            # Cerrar LONG con SELL
             close_side = "SELL"
             raw_tp = fill_price * (1 + step)
-
-            # 🔹 TP debe estar por encima del mark para ser maker en SELL
-            min_safe = mp + offset
-            tp_px = max(raw_tp, min_safe)
+            tp_px = max(raw_tp, mp + offset)
         else:
-            # Cerrar SHORT con BUY
             close_side = "BUY"
             raw_tp = fill_price * (1 - step)
+            tp_px = min(raw_tp, mp - offset)
 
-            # 🔹 TP debe estar por debajo del mark para ser maker en BUY
-            max_safe = mp - offset
-            tp_px = min(raw_tp, max_safe)
-
+        # --- LOG PREVIO ---
         notional = fill_price * qty
         pnl_gross = notional * step
         fees_est = notional * 0.0004
         pnl_net = pnl_gross - fees_est
         logging.info("PnL esp: gross=$%.2f fees=$%.2f net=$%.2f", pnl_gross, fees_est, pnl_net)
 
-        # Enviamos TP como LIMIT GTX usando el precio maker-safe calculado
+        # === PRIMER INTENTO ===
         res = self._place_limit(close_side, pos_side, tp_px, qty, tag="TP")
         used = self._snap_to_tick(tp_px)
 
-        oid = None
-        if res and isinstance(res, dict) and res.get("orderId"):
-            try:
-                oid = int(res["orderId"])
-            except Exception:
-                pass
-
         if res or self.cfg.dry_run:
-            self._event(
-                "TP_PLACED",
-                side=close_side,
-                posSide=pos_side,
-                price=round(used, 2),
-                qty=qty,
-                oid=oid,                     # ← agregado
-            )
+            oid = int(res["orderId"]) if isinstance(res, dict) and res.get("orderId") else None
+            self._event("TP_PLACED", side=close_side, posSide=pos_side, price=round(used, 2), qty=qty, oid=oid)
+            return
 
+        # === FALLÓ → RETRY ===
+        logging.warning("TP rechazado (GTX). Reintentando con pequeño delay...")
+        time.sleep(0.10)
+
+        # recalcular con nuevo mark
+        mp2 = self.c.mark_price(self.cfg.symbol)
+        if entry_side.upper() == "BUY":
+            raw_tp2 = fill_price * (1 + step)
+            tp_px2 = max(raw_tp2, mp2 + offset)
         else:
-            logging.warning("TP rechazado (GTX post-only)")
-            step = self.cfg.step_pct
-            if entry_side.upper() == "BUY":
-                close_side = "SELL"
-                tp_px = fill_price * (1 + step)
-            else:
-                close_side = "BUY"
-                tp_px = fill_price * (1 - step)
+            raw_tp2 = fill_price * (1 - step)
+            tp_px2 = min(raw_tp2, mp2 - offset)
 
-            notional = fill_price * qty
-            pnl_gross = notional * step
-            fees_est = notional * 0.0004
-            pnl_net = pnl_gross - fees_est
-            logging.info("PnL esp: gross=$%.2f fees=$%.2f net=$%.2f", pnl_gross, fees_est, pnl_net)
+        res2 = self._place_limit(close_side, pos_side, tp_px2, qty, tag="TP")
+        used2 = self._snap_to_tick(tp_px2)
 
-            res = self._place_limit(close_side, pos_side, tp_px, qty, tag="TP")
-            used = self._snap_to_tick(tp_px)
+        if res2 or self.cfg.dry_run:
+            oid2 = int(res2["orderId"]) if isinstance(res2, dict) and res2.get("orderId") else None
+            self._event("TP_PLACED_RETRY", side=close_side, posSide=pos_side, price=round(used2, 2), qty=qty, oid=oid2)
+            return
 
-            oid = None
-            if res and isinstance(res, dict) and res.get("orderId"):
-                try:
-                    oid = int(res["orderId"])
-                except Exception:
-                    pass
+        # === TOTAL FAIL ===
+        logging.error("TP totalmente rechazado luego del retry")
 
-            self._event(
-                "TP_PLACED",
-                side=close_side,
-                posSide=pos_side,
-                price=round(used, 2),
-                qty=qty,
-                oid=oid,                     # ← agregado
-            )
-
-
-            if res is None and not self.cfg.dry_run:
-                logging.warning("TP rechazado")
 
     def build_grid_orders(self) -> List[Tuple[str, str, float, float]]:
         mp = self.c.mark_price(self.cfg.symbol)
@@ -1106,9 +1075,28 @@ class GridHedgeBot:
             return
         
         now = time.time()
-        if now - getattr(self, "_last_drift_log_ts", 0) >= 30:  
-            logging.info("⚡ drift=%.3f%% net=$%.2f", drift*100, net_n)
+
+        # Calculamos el drift en %
+        drift_pct = drift * 100  # drift llega en decimal
+
+        # Inicializar variable del último valor impreso
+        last_drift_val = getattr(self, "_last_drift_pct", None)
+
+        # Condición de impresión:
+        # 1) han pasado 30s
+        # 2) o el drift cambió más de 0.05%
+        should_print = False
+
+        if now - getattr(self, "_last_drift_log_ts", 0) >= 30:
+            should_print = True
+        elif last_drift_val is None or abs(drift_pct - last_drift_val) >= 0.05:
+            should_print = True
+
+        if should_print:
+            logging.info("⚡ drift=%.3f%% net=$%.2f", drift_pct, net_n)
             self._last_drift_log_ts = now
+            self._last_drift_pct = drift_pct
+
 
 
         if need_recenter_full:
